@@ -1,0 +1,1627 @@
+// CrowdSmart – Map Screen
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import '../models/models.dart';
+import '../config/api_config.dart';
+import '../services/location_service.dart';
+import '../services/traffic_service.dart';
+import '../services/weather_service.dart';
+import 'route_suggestion_screen.dart';
+import 'destination_detail_screen.dart';
+
+class MapScreen extends StatefulWidget {
+  const MapScreen({super.key});
+
+  @override
+  State<MapScreen> createState() => _MapScreenState();
+}
+
+class _MapScreenState extends State<MapScreen> {
+  // ── Map ──────────────────────────────────────────────────────────────────
+  GoogleMapController? _mapController;
+  final Set<Marker> _markers = {};
+  MapType _mapType = MapType.normal;
+  bool _showMapTypeMenu = false;
+  Set<Polyline> _routePolylines = {};
+  TouristLocation? _selectedLocation;
+
+  // ── Traffic ───────────────────────────────────────────────────────────────
+  List<TrafficSegment> _trafficSegments = [];
+  final TrafficService _trafficService = TrafficService();
+  StreamSubscription<List<TrafficSegment>>? _trafficSub;
+
+  // ── Weather ───────────────────────────────────────────────────────────────
+  final WeatherService _weatherService = WeatherService();
+  StreamSubscription<WeatherData>? _weatherSub;
+  StreamSubscription<List<HourlyWeather>>? _hourlyForecastSub;
+  WeatherData? _currentWeather;
+  List<HourlyWeather> _hourlyForecast = [];
+  bool _showWeatherDetails = false;
+
+  // ── Location ──────────────────────────────────────────────────────────────
+  final LocationService _locationService = LocationService();
+  StreamSubscription<LatLng>? _locationSub;
+  StreamSubscription<LocationStatus>? _locationStatusSub;
+  LatLng? _userPosition;
+  double? _userHeading;
+  LocationStatus _locationStatus = LocationStatus.idle;
+  bool _followingUser = false;
+
+  static const _baguioCenter = CameraPosition(
+    target: LatLng(ApiConfig.baguioLat, ApiConfig.baguioLng),
+    zoom: ApiConfig.defaultZoom,
+  );
+
+  final bool _hasApiKey =
+      ApiConfig.googleMapsApiKey != 'YOUR_GOOGLE_MAPS_API_KEY_HERE' &&
+          ApiConfig.googleMapsApiKey.isNotEmpty;
+
+  // ── Lifecycle ───────────────────────────────────────��─────────────────────
+  @override
+  void initState() {
+    super.initState();
+    _buildMarkers();
+    _trafficService.start();
+    _trafficSub = _trafficService.trafficStream.listen((segs) {
+      if (!mounted) return;
+      setState(() => _trafficSegments = segs);
+    });
+    _weatherService.start();
+    _weatherSub = _weatherService.weatherStream.listen((weather) {
+      if (!mounted) return;
+      setState(() => _currentWeather = weather);
+    });
+    _hourlyForecastSub = _weatherService.hourlyForecastStream.listen((forecast) {
+      if (!mounted) return;
+      setState(() => _hourlyForecast = forecast);
+    });
+    _locationSub = _locationService.positionStream.listen((pos) {
+      if (!mounted) return;
+      setState(() {
+        _userPosition = pos;
+        _userHeading = _locationService.currentHeading;
+      });
+      _updateUserMarker(pos);
+      if (_followingUser && _mapController != null) {
+        _mapController!.animateCamera(CameraUpdate.newLatLng(pos));
+      }
+    });
+    _locationStatusSub = _locationService.statusStream.listen((s) {
+      if (!mounted) return;
+      setState(() => _locationStatus = s);
+      if (s == LocationStatus.denied) _showLocationDeniedSnackbar();
+    });
+  }
+
+  @override
+  void dispose() {
+    _trafficSub?.cancel();
+    _trafficService.dispose();
+    _weatherSub?.cancel();
+    _hourlyForecastSub?.cancel();
+    _weatherService.dispose();
+    _locationSub?.cancel();
+    _locationStatusSub?.cancel();
+    _locationService.dispose();
+    _mapController?.dispose();
+    super.dispose();
+  }
+
+  // ── Markers ───────────────────────────────────────────────────────────────
+  void _buildMarkers() {
+    for (final loc in AppData.locations) {
+      _markers.add(Marker(
+        markerId: MarkerId(loc.id),
+        position: loc.position,
+        icon: BitmapDescriptor.defaultMarkerWithHue(
+          loc.crowdStatus == 'Low'
+              ? BitmapDescriptor.hueGreen
+              : loc.crowdStatus == 'Moderate'
+                  ? BitmapDescriptor.hueOrange
+                  : BitmapDescriptor.hueRed,
+        ),
+        onTap: () => _onDestinationTapped(loc),
+        infoWindow: InfoWindow(
+          title: '${loc.emoji} ${loc.name}',
+          snippet: '${loc.crowdStatus} Crowd · ${loc.travelTime} away',
+          onTap: () => _navigateToDetail(loc),
+        ),
+      ));
+    }
+  }
+
+  void _updateUserMarker(LatLng pos) {
+    final updated =
+        Set<Marker>.from(_markers.where((m) => m.markerId.value != 'user_location'));
+    updated.add(Marker(
+      markerId: const MarkerId('user_location'),
+      position: pos,
+      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
+      infoWindow: const InfoWindow(title: '📍 You are here'),
+      anchor: const Offset(0.5, 0.5),
+    ));
+    if (mounted) setState(() => _markers..clear()..addAll(updated));
+  }
+
+  Set<Marker> get _visibleMarkers {
+    if (_selectedLocation == null) return _markers;
+    return _markers
+        .where((m) =>
+            m.markerId.value == _selectedLocation!.id ||
+            m.markerId.value == 'user_location')
+        .toSet();
+  }
+
+  // ── Location tracking ─────────────────────────────────────────────────────
+  Future<void> _toggleLocationTracking() async {
+    if (_locationService.isTracking) {
+      _locationService.stopTracking();
+      setState(() {
+        _followingUser = false;
+        _locationStatus = LocationStatus.idle;
+      });
+    } else {
+      await _locationService.startTracking();
+      if (_locationService.isTracking) {
+        setState(() => _followingUser = true);
+        _goToMyLocation();
+      }
+    }
+  }
+
+  void _goToMyLocation() {
+    final pos = _userPosition ?? _locationService.currentPosition;
+    if (pos != null && _mapController != null) {
+      _mapController!.animateCamera(CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: pos,
+          zoom: 17.0,
+          bearing: _userHeading ?? 0,
+          tilt: 30,
+        ),
+      ));
+      setState(() => _followingUser = true);
+    }
+  }
+
+  void _showLocationDeniedSnackbar() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: const Row(children: [
+        Icon(Icons.location_off, color: Colors.white, size: 18),
+        SizedBox(width: 8),
+        Expanded(
+            child: Text('Location permission denied.',
+                style: TextStyle(fontSize: 13))),
+      ]),
+      backgroundColor: const Color(0xFFE53935),
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+    ));
+  }
+
+  // ── Destination tap → fetch single route ──────────────────────────────────
+  void _onDestinationTapped(TouristLocation loc) {
+    _mapController?.animateCamera(CameraUpdate.newCameraPosition(
+        CameraPosition(target: loc.position, zoom: ApiConfig.detailZoom)));
+    setState(() {
+      _selectedLocation = loc;
+      _routePolylines = {};
+    });
+  }
+
+
+
+  void _navigateToDetail(TouristLocation loc) {
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => DestinationDetailScreen(location: loc)));
+  }
+
+  // ── Build routes for destination ────────────────────────────────────────
+  List<RouteOption> _buildRoutesForDestination(TouristLocation loc) {
+    switch (loc.name) {
+      case 'Burnham Park':
+      case 'Baguio Night Market':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Session Road',
+            duration: _liveDurationFor(['session_road', 'harrison_road'], 12),
+            distance: '2.8 km',
+            trafficCondition: _worstLabelFor(['session_road', 'harrison_road']),
+            trafficColor: _worstColorFor(['session_road', 'harrison_road']),
+            via: ['Session Road', 'Harrison Road', 'Gov. Pack Road'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood', 'outlook_drive'], 9),
+            distance: '2.4 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'outlook_drive']),
+            trafficColor: _worstColorFor(['leonard_wood', 'outlook_drive']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Outlook Drive'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan Road',
+            duration: _liveDurationFor(['bokawkan', 'magsaysay'], 14),
+            distance: '3.1 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'magsaysay']),
+            trafficColor: _worstColorFor(['bokawkan', 'magsaysay']),
+            via: ['Bokawkan Road', 'Magsaysay Ave.'],
+          ),
+        ];
+
+      case 'Session Road':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Harrison Road',
+            duration: _liveDurationFor(['harrison_road', 'magsaysay'], 8),
+            distance: '1.9 km',
+            trafficCondition: _worstLabelFor(['harrison_road', 'magsaysay']),
+            trafficColor: _worstColorFor(['harrison_road', 'magsaysay']),
+            via: ['Harrison Road', 'Magsaysay Ave.'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood'], 7),
+            distance: '1.7 km',
+            trafficCondition: _worstLabelFor(['leonard_wood']),
+            trafficColor: _worstColorFor(['leonard_wood']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'A. Bonifacio St.'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan Road',
+            duration: _liveDurationFor(['bokawkan', 'upper_session'], 11),
+            distance: '2.5 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'upper_session']),
+            trafficColor: _worstColorFor(['bokawkan', 'upper_session']),
+            via: ['Bokawkan Road', 'Upper Session Rd.'],
+          ),
+        ];
+
+      case 'Mines View Park':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Session → Gov. Pack',
+            duration: _liveDurationFor(['session_road', 'gov_pack', 'outlook_drive'], 22),
+            distance: '5.5 km',
+            trafficCondition: _worstLabelFor(['session_road', 'gov_pack', 'outlook_drive']),
+            trafficColor: _worstColorFor(['session_road', 'gov_pack', 'outlook_drive']),
+            via: ['Session Road', 'Gov. Pack Road', 'Outlook Drive'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood', 'camp_john_hay_rd'], 17),
+            distance: '4.9 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'camp_john_hay_rd']),
+            trafficColor: _worstColorFor(['leonard_wood', 'camp_john_hay_rd']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Military Cut-off', 'Outlook Drive'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan Bypass',
+            duration: _liveDurationFor(['bokawkan', 'naguilian_road'], 20),
+            distance: '5.8 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'naguilian_road']),
+            trafficColor: _worstColorFor(['bokawkan', 'naguilian_road']),
+            via: ['Bokawkan Road', 'Naguilian Road', 'Aspinall Ave'],
+          ),
+        ];
+
+      case 'The Mansion':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Session → Gov. Pack',
+            duration: _liveDurationFor(['session_road', 'gov_pack'], 14),
+            distance: '3.2 km',
+            trafficCondition: _worstLabelFor(['session_road', 'gov_pack']),
+            trafficColor: _worstColorFor(['session_road', 'gov_pack']),
+            via: ['Session Road', 'Gov. Pack Road', 'A. Bonifacio St.'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood', 'outlook_drive'], 10),
+            distance: '2.6 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'outlook_drive']),
+            trafficColor: _worstColorFor(['leonard_wood', 'outlook_drive']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Outlook Drive'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan → Magsaysay',
+            duration: _liveDurationFor(['bokawkan', 'magsaysay', 'naguilian_road'], 13),
+            distance: '3.5 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'magsaysay', 'naguilian_road']),
+            trafficColor: _worstColorFor(['bokawkan', 'magsaysay', 'naguilian_road']),
+            via: ['Bokawkan Road', 'Magsaysay Ave.', 'Naguilian Road'],
+          ),
+        ];
+
+      case 'Camp John Hay':
+      case 'Good Shepherd Convent':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Session → Kennon',
+            duration: _liveDurationFor(['session_road', 'kennon_road'], 18),
+            distance: '4.5 km',
+            trafficCondition: _worstLabelFor(['session_road', 'kennon_road']),
+            trafficColor: _worstColorFor(['session_road', 'kennon_road']),
+            via: ['Session Road', 'Gov. Pack Road', 'Kennon Road'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Military Cut-off',
+            duration: _liveDurationFor(['leonard_wood', 'camp_john_hay_rd'], 13),
+            distance: '3.8 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'camp_john_hay_rd']),
+            trafficColor: _worstColorFor(['leonard_wood', 'camp_john_hay_rd']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Military Cut-off', 'CJH Road'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan → Loakan',
+            duration: _liveDurationFor(['bokawkan', 'kennon_road'], 16),
+            distance: '4.2 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'kennon_road']),
+            trafficColor: _worstColorFor(['bokawkan', 'kennon_road']),
+            via: ['Bokawkan Road', 'Magsaysay Ave.', 'Loakan Road'],
+          ),
+        ];
+
+      case 'Botanical Garden':
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Magsaysay Ave',
+            duration: _liveDurationFor(['magsaysay', 'harrison_road'], 10),
+            distance: '2.3 km',
+            trafficCondition: _worstLabelFor(['magsaysay', 'harrison_road']),
+            trafficColor: _worstColorFor(['magsaysay', 'harrison_road']),
+            via: ['Magsaysay Ave.', 'Harrison Road', 'Naguilian Road'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood', 'naguilian_road'], 8),
+            distance: '2.0 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'naguilian_road']),
+            trafficColor: _worstColorFor(['leonard_wood', 'naguilian_road']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Naguilian Road'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan Road',
+            duration: _liveDurationFor(['bokawkan', 'naguilian_road'], 11),
+            distance: '2.7 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'naguilian_road']),
+            trafficColor: _worstColorFor(['bokawkan', 'naguilian_road']),
+            via: ['Bokawkan Road', 'Naguilian Road', 'Aspinall Ave'],
+          ),
+        ];
+
+      default:
+        return [
+          RouteOption(
+            id: 'a', name: 'Route A – Session Road',
+            duration: _liveDurationFor(['session_road', 'gov_pack', 'harrison_road'], 28),
+            distance: '7.1 km',
+            trafficCondition: _worstLabelFor(['session_road', 'gov_pack', 'harrison_road']),
+            trafficColor: _worstColorFor(['session_road', 'gov_pack', 'harrison_road']),
+            via: ['Session Road', 'Gov. Pack Road', 'Harrison Road'],
+          ),
+          RouteOption(
+            id: 'b', name: 'Route B – Leonard Wood Rd',
+            duration: _liveDurationFor(['leonard_wood', 'camp_john_hay_rd'], 19),
+            distance: '6.3 km',
+            trafficCondition: _worstLabelFor(['leonard_wood', 'camp_john_hay_rd']),
+            trafficColor: _worstColorFor(['leonard_wood', 'camp_john_hay_rd']),
+            isRecommended: true,
+            via: ['Leonard Wood Rd', 'Military Cut-off', 'Outlook Drive'],
+          ),
+          RouteOption(
+            id: 'c', name: 'Route C – Bokawkan Road',
+            duration: _liveDurationFor(['bokawkan', 'magsaysay', 'naguilian_road'], 24),
+            distance: '7.8 km',
+            trafficCondition: _worstLabelFor(['bokawkan', 'magsaysay', 'naguilian_road']),
+            trafficColor: _worstColorFor(['bokawkan', 'magsaysay', 'naguilian_road']),
+            via: ['Bokawkan Road', 'Magsaysay Ave.', 'Naguilian Road'],
+          ),
+        ];
+    }
+  }
+
+  // ── Traffic helpers ────────────────────────────────────────────────────────
+  Color _worstColorFor(List<String> segIds) {
+    Color worst = const Color(0xFF4CAF50);
+    for (final id in segIds) {
+      final seg = _trafficSegments.where((s) => s.id == id).firstOrNull;
+      if (seg == null) continue;
+      if (seg.color == const Color(0xFFE53935)) return seg.color;
+      if (seg.color == const Color(0xFFFFA726)) worst = seg.color;
+    }
+    return worst;
+  }
+
+  String _worstLabelFor(List<String> segIds) {
+    final c = _worstColorFor(segIds);
+    if (c == const Color(0xFFE53935)) return 'Heavy Traffic';
+    if (c == const Color(0xFFFFA726)) return 'Moderate Traffic';
+    return 'Light Traffic';
+  }
+
+  String _liveDurationFor(List<String> segIds, int baseMinutes) {
+    if (_trafficSegments.isEmpty) return '$baseMinutes mins';
+    final c = _worstColorFor(segIds);
+    double factor;
+    if (c == const Color(0xFFE53935)) {
+      factor = 1.50;
+    } else if (c == const Color(0xFFFFA726)) {
+      factor = 1.20;
+    } else {
+      factor = 1.00;
+    }
+    final adjusted = (baseMinutes * factor).round();
+    return '$adjusted mins';
+  }
+
+  void _resetToCenter() {
+    _mapController?.animateCamera(
+        CameraUpdate.newCameraPosition(_baguioCenter));
+  }
+
+  // ── Weather Panel ─────────────────────────────────────────────────────────
+  Widget _buildWeatherPanel() {
+    if (_currentWeather == null && _showWeatherDetails == false) {
+      return const SizedBox.shrink();
+    }
+
+    final weather = _currentWeather;
+    if (weather == null) return const SizedBox.shrink();
+
+    return Positioned(
+      top: 12,
+      right: 12,
+      child: SafeArea(
+        child: GestureDetector(
+          onTap: () => setState(() => _showWeatherDetails = !_showWeatherDetails),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 300),
+            width: _showWeatherDetails ? 320 : 140,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.15),
+                  blurRadius: 12,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: _showWeatherDetails
+                ? _buildWeatherDetails(weather)
+                : _buildWeatherCompact(weather),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWeatherCompact(WeatherData weather) {
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    weather.temperatureString,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF2D3748),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    weather.condition,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xFF6B7280),
+                    ),
+                  ),
+                ],
+              ),
+              Text(
+                weather.weatherIcon,
+                style: const TextStyle(fontSize: 32),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            decoration: BoxDecoration(
+              color: _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Center(
+              child: Text(
+                weather.trafficAdvisory,
+                style: TextStyle(
+                  fontSize: 9,
+                  color: _trafficImpactColor(weather.trafficImpact),
+                  fontWeight: FontWeight.bold,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Tap for details ↓',
+            style: TextStyle(fontSize: 8, color: Color(0xFF9CA3AF)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWeatherDetails(WeatherData weather) {
+    return SingleChildScrollView(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Header
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Weather & Driving',
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF2D3748),
+                      ),
+                    ),
+                    Text(
+                      'Baguio City',
+                      style: const TextStyle(
+                        fontSize: 10,
+                        color: Color(0xFF9CA3AF),
+                      ),
+                    ),
+                  ],
+                ),
+                Text(
+                  weather.weatherIcon,
+                  style: const TextStyle(fontSize: 28),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // Main weather card
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.2),
+                    _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.05),
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.3),
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Temperature
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            weather.temperatureString,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF2D3748),
+                            ),
+                          ),
+                          if (weather.feelsLike != null) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              'Feels like ${weather.feelsLike?.toStringAsFixed(0)}°C',
+                              style: const TextStyle(
+                                fontSize: 10,
+                                color: Color(0xFF6B7280),
+                              ),
+                            ),
+                          ],
+                        },
+                      ),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            weather.condition,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF2D3748),
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            weather.description,
+                            style: const TextStyle(
+                              fontSize: 9,
+                              color: Color(0xFF6B7280),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  // Weather metrics
+                  GridView.count(
+                    crossAxisCount: 4,
+                    mainAxisSpacing: 6,
+                    crossAxisSpacing: 6,
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    children: [
+                      _buildWeatherMetric('💧', '${weather.humidity}%', 'Humidity'),
+                      _buildWeatherMetric('💨', '${weather.windSpeed.toStringAsFixed(1)}m/s', 'Wind'),
+                      _buildWeatherMetric('👁️', '${(weather.visibility / 1000).toStringAsFixed(1)}km', 'Visibility'),
+                      _buildWeatherMetric('🌍', '${weather.pressure}mb', 'Pressure'),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            // Traffic impact alert
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: _trafficImpactColor(weather.trafficImpact).withValues(alpha: 0.3),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    _trafficImpactIcon(weather.trafficImpact),
+                    size: 16,
+                    color: _trafficImpactColor(weather.trafficImpact),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'Driving Advisory',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF2D3748),
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          weather.trafficAdvisory,
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: _trafficImpactColor(weather.trafficImpact),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            // Hourly forecast
+            if (_hourlyForecast.isNotEmpty) ...[
+              const Text(
+                'Hourly Forecast',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF2D3748),
+                ),
+              ),
+              const SizedBox(height: 6),
+              SizedBox(
+                height: 78,
+                child: ListView.builder(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _hourlyForecast.take(6).length,
+                  itemBuilder: (_, idx) {
+                    final forecast = _hourlyForecast[idx];
+                    return Container(
+                      width: 56,
+                      margin: const EdgeInsets.only(right: 6),
+                      padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 5),
+                      decoration: BoxDecoration(
+                        color: Colors.grey[100],
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          Text(
+                            '${forecast.dateTime.hour.toString().padLeft(2, '0')}h',
+                            style: const TextStyle(
+                              fontSize: 8,
+                              color: Color(0xFF6B7280),
+                              fontWeight: FontWeight.w500,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                          Text(
+                            forecast.weather.weatherIcon,
+                            style: const TextStyle(fontSize: 16),
+                          ),
+                          Text(
+                            '${forecast.weather.temperature.toStringAsFixed(0)}°',
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF2D3748),
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWeatherMetric(String icon, String value, String label) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(icon, style: const TextStyle(fontSize: 16)),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          style: const TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.bold,
+            color: Color(0xFF2D3748),
+          ),
+        ),
+        const SizedBox(height: 1),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 7,
+            color: Color(0xFF9CA3AF),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Color _trafficImpactColor(TrafficImpact impact) {
+    switch (impact) {
+      case TrafficImpact.none:
+        return const Color(0xFF4CAF50);
+      case TrafficImpact.light:
+        return const Color(0xFFFFA726);
+      case TrafficImpact.moderate:
+        return const Color(0xFFFF6F00);
+      case TrafficImpact.severe:
+        return const Color(0xFFE53935);
+    }
+  }
+
+  IconData _trafficImpactIcon(TrafficImpact impact) {
+    switch (impact) {
+      case TrafficImpact.none:
+        return Icons.check_circle_outline;
+      case TrafficImpact.light:
+        return Icons.info_outline;
+      case TrafficImpact.moderate:
+        return Icons.warning_amber_rounded;
+      case TrafficImpact.severe:
+        return Icons.dangerous;
+    }
+  }
+
+  // ...existing code...
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          _hasApiKey ? _buildGoogleMap() : _buildNoApiKeyPlaceholder(),
+          _buildAlertTicker(),
+          if (_selectedLocation != null) _buildSelectedCard(),
+          if (_selectedLocation == null) _buildBottomChips(),
+          if (_showMapTypeMenu) _buildMapTypeMenu(),
+          _buildFabs(),
+          if (_locationStatus == LocationStatus.tracking) _buildLocationBar(),
+          _buildWeatherPanel(),
+        ],
+      ),
+    );
+  }
+
+  // ── Google Map ────────────────────────────────────────────────────────────
+  Widget _buildGoogleMap() {
+    return GoogleMap(
+      onMapCreated: (c) => setState(() => _mapController = c),
+      initialCameraPosition: _baguioCenter,
+      markers: _visibleMarkers,
+      polylines: _routePolylines,
+      trafficEnabled: true,
+      myLocationEnabled: true,
+      myLocationButtonEnabled: false,
+      zoomControlsEnabled: false,
+      mapToolbarEnabled: false,
+      compassEnabled: true,
+      mapType: _mapType,
+      onTap: (_) => setState(() {
+        _selectedLocation = null;
+        _showMapTypeMenu = false;
+        _routePolylines = {};
+      }),
+      onCameraMove: (_) {
+        if (_showMapTypeMenu) setState(() => _showMapTypeMenu = false);
+        if (_followingUser) setState(() => _followingUser = false);
+      },
+    );
+  }
+
+  // ── Alert ticker ──────────────────────────────────────────────────────────
+  Widget _buildAlertTicker() {
+    final heavySegs =
+        _trafficSegments.where((s) => s.level == TrafficLevel.heavy).toList();
+    if (heavySegs.isEmpty) return const SizedBox.shrink();
+    final msg = heavySegs.map((s) => '⚠️ ${s.name}: Heavy traffic').join(' · ');
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        child: Container(
+          margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: const Color(0xFFE53935),
+            borderRadius: BorderRadius.circular(10),
+            boxShadow: [
+              BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.15),
+                  blurRadius: 6,
+                  offset: const Offset(0, 2)),
+            ],
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.warning_amber_rounded,
+                  color: Colors.white, size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(msg,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Selected destination card ─────────────────────────────────────────────
+  Widget _buildSelectedCard() {
+    final loc = _selectedLocation!;
+    final destinationRoutes = _buildRoutesForDestination(loc);
+
+    return Positioned(
+      bottom: 16,
+      left: 12,
+      right: 12,
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+                color: Colors.black.withValues(alpha: 0.15),
+                blurRadius: 16,
+                offset: const Offset(0, 4)),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Header
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 14, 8, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('${loc.emoji} ${loc.name}',
+                            style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 15,
+                                color: Color(0xFF2D3748)),
+                            overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Row(children: [
+                          Container(
+                              width: 7,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                  color: loc.statusColor,
+                                  shape: BoxShape.circle)),
+                          const SizedBox(width: 4),
+                          Text('${loc.crowdStatus} Crowd',
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: loc.statusColor,
+                                  fontWeight: FontWeight.w600)),
+                          const SizedBox(width: 8),
+                          const Icon(Icons.access_time,
+                              size: 11, color: Color(0xFF9CA3AF)),
+                          const SizedBox(width: 2),
+                          Text(loc.travelTime,
+                              style: const TextStyle(
+                                  fontSize: 11, color: Color(0xFF6B7280))),
+                        ]),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close,
+                        size: 18, color: Color(0xFF9CA3AF)),
+                    onPressed: () => setState(() {
+                      _selectedLocation = null;
+                      _routePolylines = {};
+                    }),
+                  ),
+                ],
+              ),
+            ),
+            // Available Routes
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(children: [
+                    Icon(Icons.alt_route,
+                        size: 13,
+                        color: Color(0xFF4CAF50)),
+                    SizedBox(width: 5),
+                    Text('Available Routes',
+                        style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF2D3748))),
+                  ]),
+                  const SizedBox(height: 8),
+                  // Routes list
+                  SizedBox(
+                    height: 130,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: destinationRoutes.length,
+                      itemBuilder: (_, idx) {
+                        final route = destinationRoutes[idx];
+                        return Container(
+                          width: 160,
+                          margin: const EdgeInsets.only(right: 8),
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: route.isRecommended
+                                ? route.trafficColor.withValues(alpha: 0.1)
+                                : Colors.grey[100],
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: route.isRecommended
+                                  ? route.trafficColor
+                                  : Colors.grey[300]!,
+                              width: route.isRecommended ? 2 : 1,
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (route.isRecommended)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: route.trafficColor,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: const Text(
+                                    'Recommended',
+                                    style: TextStyle(
+                                      fontSize: 8,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              const SizedBox(height: 4),
+                              Text(
+                                route.name,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF2D3748),
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                children: [
+                                  const Icon(Icons.schedule,
+                                      size: 10, color: Color(0xFF6B7280)),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    route.duration,
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      color: Color(0xFF6B7280),
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Row(
+                                children: [
+                                  const Icon(Icons.directions,
+                                      size: 10, color: Color(0xFF6B7280)),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    route.distance,
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      color: Color(0xFF6B7280),
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              Container(
+                                width: double.infinity,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: route.trafficColor
+                                      .withValues(alpha: 0.2),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Center(
+                                  child: Text(
+                                    route.trafficCondition,
+                                    style: TextStyle(
+                                      fontSize: 9,
+                                      color: route.trafficColor,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // Buttons
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+              child: Row(children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const RouteSuggestionScreen())),
+                    icon: const Icon(Icons.alt_route, size: 16),
+                    label: const Text('More Routes'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF4CAF50),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _navigateToDetail(loc),
+                    icon: const Icon(Icons.info_outline, size: 16),
+                    label: const Text('Details'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF2196F3),
+                      side: const BorderSide(color: Color(0xFF2196F3)),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                    ),
+                  ),
+                ),
+              ]),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Bottom destination chips ───────────────────────────────────────────────
+  Widget _buildBottomChips() {
+    return Positioned(
+      bottom: 16,
+      left: 12,
+      right: 12,
+      child: SizedBox(
+        height: 42,
+        child: ListView.builder(
+          scrollDirection: Axis.horizontal,
+          itemCount: AppData.locations.length,
+          itemBuilder: (_, i) {
+            final loc = AppData.locations[i];
+            return GestureDetector(
+              onTap: () => _onDestinationTapped(loc),
+              child: Container(
+                margin: const EdgeInsets.only(right: 8),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: loc.statusColor, width: 1.5),
+                  boxShadow: [
+                    BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.08),
+                        blurRadius: 4),
+                  ],
+                ),
+                child: Row(
+                  children: [
+                    Text(loc.emoji, style: const TextStyle(fontSize: 14)),
+                    const SizedBox(width: 4),
+                    Text(loc.name.split(' ').first,
+                        style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF2D3748))),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  // ── Location bar ──────────────────────────────────────────────────────────
+  Widget _buildLocationBar() {
+    final pos = _userPosition;
+    return Positioned(
+      left: 12,
+      right: 72,
+      bottom: _selectedLocation != null ? 370 : 70,
+      child: GestureDetector(
+        onTap: _goToMyLocation,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color:
+                _followingUser ? const Color(0xFF2196F3) : Colors.white,
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: [
+              BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.12),
+                  blurRadius: 8,
+                  offset: const Offset(0, 2)),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _followingUser ? Icons.navigation : Icons.my_location,
+                size: 14,
+                color: _followingUser
+                    ? Colors.white
+                    : const Color(0xFF2196F3),
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  pos != null
+                      ? '${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}'
+                      : 'Getting location…',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: _followingUser
+                        ? Colors.white
+                        : const Color(0xFF2196F3),
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (_followingUser) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.25),
+                      borderRadius: BorderRadius.circular(6)),
+                  child: const Text('LIVE',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.5)),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── FABs ──────────────────────────────────────────────────────────────────
+  Widget _buildFabs() {
+    final bottomOffset = _selectedLocation != null ? 380.0 : 72.0;
+    return Positioned(
+      right: 12,
+      bottom: bottomOffset,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton.small(
+            heroTag: 'maptype',
+            backgroundColor: Colors.white,
+            foregroundColor: const Color(0xFF2D3748),
+            onPressed: () =>
+                setState(() => _showMapTypeMenu = !_showMapTypeMenu),
+            child: const Icon(Icons.layers, size: 20),
+          ),
+          const SizedBox(height: 8),
+          FloatingActionButton.small(
+            heroTag: 'recenter',
+            backgroundColor: Colors.white,
+            foregroundColor: const Color(0xFF4CAF50),
+            onPressed: _resetToCenter,
+            child: const Icon(Icons.center_focus_strong, size: 20),
+          ),
+          const SizedBox(height: 8),
+          _buildLocationFab(),
+          const SizedBox(height: 8),
+          FloatingActionButton.small(
+            heroTag: 'zoomin',
+            backgroundColor: Colors.white,
+            foregroundColor: const Color(0xFF2D3748),
+            onPressed: () =>
+                _mapController?.animateCamera(CameraUpdate.zoomIn()),
+            child: const Icon(Icons.add, size: 20),
+          ),
+          const SizedBox(height: 8),
+          FloatingActionButton.small(
+            heroTag: 'zoomout',
+            backgroundColor: Colors.white,
+            foregroundColor: const Color(0xFF2D3748),
+            onPressed: () =>
+                _mapController?.animateCamera(CameraUpdate.zoomOut()),
+            child: const Icon(Icons.remove, size: 20),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLocationFab() {
+    if (_locationStatus == LocationStatus.loading) {
+      return FloatingActionButton.small(
+        heroTag: 'location',
+        backgroundColor: Colors.white,
+        foregroundColor: const Color(0xFF2196F3),
+        onPressed: null,
+        child: const SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+                strokeWidth: 2, color: Color(0xFF2196F3))),
+      );
+    }
+    if (_followingUser && _locationStatus == LocationStatus.tracking) {
+      return FloatingActionButton.small(
+        heroTag: 'location',
+        backgroundColor: const Color(0xFF2196F3),
+        foregroundColor: Colors.white,
+        onPressed: _goToMyLocation,
+        child: const Icon(Icons.navigation, size: 20),
+      );
+    }
+    if (_locationStatus == LocationStatus.tracking) {
+      return FloatingActionButton.small(
+        heroTag: 'location',
+        backgroundColor: Colors.white,
+        foregroundColor: const Color(0xFF2196F3),
+        onPressed: _goToMyLocation,
+        child: const Icon(Icons.my_location, size: 20),
+      );
+    }
+    if (_locationStatus == LocationStatus.denied ||
+        _locationStatus == LocationStatus.error) {
+      return FloatingActionButton.small(
+        heroTag: 'location',
+        backgroundColor: Colors.white,
+        foregroundColor: const Color(0xFFE53935),
+        onPressed: _toggleLocationTracking,
+        child: const Icon(Icons.location_off, size: 20),
+      );
+    }
+    return FloatingActionButton.small(
+      heroTag: 'location',
+      backgroundColor: Colors.white,
+      foregroundColor: const Color(0xFF9CA3AF),
+      onPressed: _toggleLocationTracking,
+      child: const Icon(Icons.my_location, size: 20),
+    );
+  }
+
+  // ── Map type menu ─────────────────────────────────────────────────────────
+  Widget _buildMapTypeMenu() {
+    return Positioned(
+      right: 60,
+      bottom: _selectedLocation != null ? 228 : 258,
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+                color: Colors.black.withValues(alpha: 0.15),
+                blurRadius: 10,
+                offset: const Offset(0, 3)),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _mapTypeOption(MapType.normal, '🗺️', 'Default'),
+            _mapTypeOption(MapType.satellite, '🛰️', 'Satellite'),
+            _mapTypeOption(MapType.terrain, '⛰️', 'Terrain'),
+            _mapTypeOption(MapType.hybrid, '🌐', 'Hybrid'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _mapTypeOption(MapType type, String emoji, String label) {
+    final selected = _mapType == type;
+    return GestureDetector(
+      onTap: () => setState(() {
+        _mapType = type;
+        _showMapTypeMenu = false;
+      }),
+      child: Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: selected
+              ? const Color(0xFF2196F3).withValues(alpha: 0.1)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(emoji, style: const TextStyle(fontSize: 16)),
+            const SizedBox(width: 8),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 13,
+                    fontWeight:
+                        selected ? FontWeight.bold : FontWeight.normal,
+                    color: selected
+                        ? const Color(0xFF2196F3)
+                        : const Color(0xFF2D3748))),
+            if (selected) ...[
+              const SizedBox(width: 6),
+              const Icon(Icons.check, size: 14, color: Color(0xFF2196F3)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── No API key placeholder ────────────────────────────────────────────────
+  Widget _buildNoApiKeyPlaceholder() {
+    return Container(
+      color: const Color(0xFFE8F5E9),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 90,
+                height: 90,
+                decoration: BoxDecoration(
+                    color: const Color(0xFF4CAF50).withValues(alpha: 0.15),
+                    shape: BoxShape.circle),
+                child: const Icon(Icons.map,
+                    size: 48, color: Color(0xFF4CAF50)),
+              ),
+              const SizedBox(height: 24),
+              const Text('🗺️ Google Maps Setup Required',
+                  style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF2D3748)),
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFFE5E7EB))),
+                child: const Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Steps to enable the map:',
+                        style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                            color: Color(0xFF2D3748))),
+                    SizedBox(height: 10),
+                    _SetupStep(
+                        n: '1', text: 'Go to console.cloud.google.com'),
+                    _SetupStep(
+                        n: '2',
+                        text:
+                            'Enable Maps SDK for Android + Directions API'),
+                    _SetupStep(
+                        n: '3', text: 'Create API Key under Credentials'),
+                    _SetupStep(
+                        n: '4',
+                        text:
+                            'Set googleMapsApiKey in lib/config/api_config.dart'),
+                    _SetupStep(
+                        n: '5',
+                        text:
+                            'Set android:value in AndroidManifest.xml'),
+                    _SetupStep(n: '6', text: 'Rebuild the app'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => const RouteSuggestionScreen())),
+                icon: const Icon(Icons.alt_route),
+                label: const Text('View Route Suggestions'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF4CAF50),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 24, vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Setup step widget ─────────────────────────────────────────────────────────
+class _SetupStep extends StatelessWidget {
+  final String n;
+  final String text;
+  const _SetupStep({required this.n, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 20,
+            height: 20,
+            decoration: const BoxDecoration(
+                color: Color(0xFF4CAF50), shape: BoxShape.circle),
+            child: Center(
+              child: Text(n,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(text,
+                style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF6B7280),
+                    height: 1.5)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
